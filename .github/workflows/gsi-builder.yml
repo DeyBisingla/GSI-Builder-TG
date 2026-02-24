@@ -1,0 +1,343 @@
+name: Automatic GSI Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: 'ROM Manifest URL'
+        required: true
+        default: 'https://github.com/LineageOS/android.git'
+      rom_branch:
+        description: 'ROM Branch'
+        required: true
+        default: 'lineage-22.1'
+      build_variant:
+        description: 'Build Variant'
+        required: true
+        default: 'treble_arm64_bvN-userdebug'
+        type: choice
+        options:
+          - treble_arm64_bvN-userdebug
+          - treble_arm64_bgN-userdebug
+          - treble_a64_bvN-userdebug
+          - treble_a64_bgN-userdebug
+      telegram_chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      telegram_bot_token:
+        description: 'Telegram Bot Token'
+        required: true
+
+env:
+  ROM_URL: ${{ github.event.inputs.rom_url }}
+  ROM_BRANCH: ${{ github.event.inputs.rom_branch }}
+  BUILD_VARIANT: ${{ github.event.inputs.build_variant }}
+  TELEGRAM_CHAT_ID: ${{ github.event.inputs.telegram_chat_id }}
+  TELEGRAM_BOT_TOKEN: ${{ github.event.inputs.telegram_bot_token }}
+  CLOUDFLARE_KEY: ${{ secrets.CLOUDFLARE_KEY }}
+  PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+  GOFILE_API_KEY: ${{ secrets.GOFILE_API_KEY }}
+  CCACHE_COMPRESS: true
+  CCACHE_MAXSIZE: 50G
+
+jobs:
+  build-gsi:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Status Server & Cloudflare Tunnel
+        run: |
+          # Install Python & Flask
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip curl
+          pip3 install flask
+          
+          # Start status server di background
+          echo "Starting status server on port 4567..."
+          nohup python3 status_server.py > status_server.log 2>&1 &
+          sleep 3
+          
+          # Cek status server
+          curl -s http://localhost:4567/api/status || echo "Status server not ready yet"
+          
+          # Install cloudflared
+          echo "Installing cloudflared..."
+          sudo mkdir -p --mode=0755 /usr/share/keyrings
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
+          echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update && sudo apt-get install -y cloudflared
+          
+          # Install cloudflared service dengan tunnel key
+          if [ -n "$CLOUDFLARE_KEY" ]; then
+            echo "Installing cloudflared service..."
+            sudo cloudflared service install "$CLOUDFLARE_KEY"
+            
+            # Tunggu tunnel aktif
+            echo "Waiting for Cloudflare tunnel..."
+            sleep 10
+            
+            # Cek tunnel status
+            curl -s https://gsi.hanhosting.dpdns.org/api/status || echo "Tunnel not ready yet, continuing..."
+          else
+            echo "Warning: CLOUDFLARE_KEY not set, tunnel not established"
+          fi
+          
+          # Update status
+          echo '{"status": "initializing", "step": "setup", "progress": 5, "message": "Setup complete, installing dependencies..."}' > status.json
+
+      - name: Initialize Build Environment
+        id: init
+        run: |
+          echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
+          echo '{"status": "initializing", "step": "deps", "progress": 5, "message": "Menginstall dependencies..."}' > status.json
+          
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential curl flex g++-multilib gcc-multilib git \
+            gnupg gperf libxml2 lib32z1-dev liblz4-tool libncurses5-dev \
+            libsdl1.2-dev libwxgtk3.0-gtk3-dev imagemagick git lunzip lzop \
+            schedtool squashfs-tools xsltproc zip zlib1g-dev openjdk-11-jdk \
+            python3 perl xmlstarlet virtualenv xz-utils rr jq libncurses5 \
+            pngcrush lib32ncurses5-dev git-lfs libxml2-utils repo
+
+      - name: Setup SDK & Repo
+        run: |
+          echo '{"status": "initializing", "step": "repo", "progress": 10, "message": "Setup repo command..."}' > status.json
+          
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+          
+          git config --global user.name "GSI Builder"
+          git config --global user.email "builder@gsi.local"
+          git config --global color.ui false
+
+      - name: Setup CCache
+        run: |
+          echo '{"status": "initializing", "step": "ccache", "progress": 15, "message": "Setup ccache..."}' > status.json
+          
+          export USE_CCACHE=1
+          export CCACHE_COMPRESS=1
+          export CCACHE_MAXSIZE=50G
+          ccache -M 50G
+          ccache -o compression=true
+
+      - name: Sync ROM Source
+        id: sync
+        run: |
+          echo '{"status": "syncing", "step": "repo_init", "progress": 20, "message": "Initializing repo..."}' > status.json
+          
+          mkdir -p ~/rom && cd ~/rom
+          repo init -u $ROM_URL -b $ROM_BRANCH --depth=1 --no-repo-verify
+          
+          echo '{"status": "syncing", "step": "treble_manifest", "progress": 25, "message": "Adding Treble manifest..."}' > status.json
+          
+          git clone https://github.com/TrebleDroid/treble_manifest .repo/local_manifests -b android-15.0
+          
+          # Remove replace.xml untuk ROM non-AOSP
+          if [[ "$ROM_URL" != *"android.git"* ]] || [[ "$ROM_URL" != *"platform"* ]]; then
+            rm -f .repo/local_manifests/replace.xml
+          fi
+          
+          echo '{"status": "syncing", "step": "repo_sync", "progress": 30, "message": "Syncing source (ini akan lama)..."}' > status.json
+          
+          repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune 2>&1 | tee sync.log || {
+            echo '{"status": "error", "step": "repo_sync", "progress": 30, "message": "Repo sync failed", "error": "Check logs"}' > status.json
+            exit 1
+          }
+
+      - name: Apply Treble Patches
+        run: |
+          echo '{"status": "patching", "step": "apply_patches", "progress": 50, "message": "Applying Treble patches..."}' > status.json
+          
+          cd ~/rom
+          
+          # Download patches
+          curl -L -o patches.zip https://github.com/TrebleDroid/treble_experimentations/releases/latest/download/patches-for-developers.zip
+          unzip -q patches.zip -d patches/
+          
+          # Apply patches
+          for patch in patches/*/; do
+            if [ -d "$patch" ]; then
+              project=$(basename "$patch")
+              if [ -d "$project" ]; then
+                cd "$project"
+                git am ../patches/$project/*.patch 2>/dev/null || echo "Patch failed for $project, continuing..."
+                cd ~/rom
+              fi
+            fi
+          done
+
+      - name: Generate Device Config
+        run: |
+          echo '{"status": "configuring", "step": "generate_config", "progress": 55, "message": "Generating device config..."}' > status.json
+          
+          cd ~/rom
+          
+          # Detect ROM type untuk common.mk
+          if [ -f "vendor/lineage/config/common_full_phone.mk" ]; then
+            COMMON_MK="vendor/lineage/config/common_full_phone.mk"
+          elif [ -f "vendor/aosp/config/common_full_phone.mk" ]; then
+            COMMON_MK="vendor/aosp/config/common_full_phone.mk"
+          else
+            COMMON_MK=$(find vendor -name "common_full_phone.mk" 2>/dev/null | head -1)
+          fi
+          
+          cd device/phh/treble
+          bash generate.sh $COMMON_MK
+
+      - name: Build GSI
+        id: build
+        continue-on-error: true
+        run: |
+          echo '{"status": "building", "step": "compile", "progress": 60, "message": "Starting build..."}' > status.json
+          
+          cd ~/rom
+          source build/envsetup.sh
+          
+          echo '{"status": "building", "step": "lunch", "progress": 65, "message": "Lunch '$BUILD_VARIANT'..."}' > status.json
+          lunch $BUILD_VARIANT
+          
+          echo '{"status": "building", "step": "make", "progress": 70, "message": "Building system image (bisa 1-3 jam)..."}' > status.json
+          
+          WITHOUT_CHECK_API=true make -j$(nproc --all) systemimage 2>&1 | tee build.log
+          
+          if [ ${PIPESTATUS[0]} -eq 0 ]; then
+            echo "build_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "build_success=false" >> $GITHUB_OUTPUT
+            echo '{"status": "failed", "step": "build", "progress": 70, "message": "Build failed", "error_log": "build.log"}' > status.json
+            exit 1
+          fi
+
+      - name: Compress & Upload
+        id: upload
+        if: steps.build.outputs.build_success == 'true'
+        run: |
+          echo '{"status": "uploading", "step": "compress", "progress": 85, "message": "Compressing system image..."}' > status.json
+          
+          cd ~/rom/out/target/product/phh*/
+          
+          # Compress
+          xz -9 -T$(nproc --all) -v -z system.img
+          
+          IMG_NAME="GSI-$(date +%Y%m%d)-${BUILD_VARIANT}.img.xz"
+          mv system.img.xz $IMG_NAME
+          
+          echo "IMG_NAME=$IMG_NAME" >> $GITHUB_ENV
+          echo "IMG_PATH=$(pwd)/$IMG_NAME" >> $GITHUB_ENV
+          
+          # Upload to PixelDrain
+          echo '{"status": "uploading", "step": "pixeldrain", "progress": 90, "message": "Uploading to PixelDrain..."}' > status.json
+          
+          if [ -n "$PIXELDRAIN_API_KEY" ]; then
+            PD_RESPONSE=$(curl -T "$IMG_NAME" -u :$PIXELDRAIN_API_KEY https://pixeldrain.com/api/file/)
+            PD_LINK=$(echo $PD_RESPONSE | jq -r '.link // empty')
+            echo "PIXELDRAIN_LINK=$PD_LINK" >> $GITHUB_ENV
+          fi
+          
+          # Upload to GoFile
+          echo '{"status": "uploading", "step": "gofile", "progress": 95, "message": "Uploading to GoFile..."}' > status.json
+          
+          if [ -n "$GOFILE_API_KEY" ]; then
+            GF_SERVER=$(curl -s https://api.gofile.io/getServer | jq -r '.data.server')
+            GF_RESPONSE=$(curl -F "file=@$IMG_NAME" -H "Authorization: Bearer $GOFILE_API_KEY" "https://$GF_SERVER.gofile.io/uploadFile")
+            GF_LINK=$(echo $GF_RESPONSE | jq -r '.data.downloadPage // empty')
+            echo "GOFILE_LINK=$GF_LINK" >> $GITHUB_ENV
+          fi
+
+      - name: Finalize Status
+        run: |
+          END_TIME=$(date +%s)
+          START_TIME=${{ steps.init.outputs.start_time }}
+          DURATION=$((END_TIME - START_TIME))
+          DURATION_MIN=$((DURATION / 60))
+          
+          if [ "${{ steps.build.outputs.build_success }}" == "true" ]; then
+            cat > status.json << EOF
+          {
+            "status": "success",
+            "step": "complete",
+            "progress": 100,
+            "message": "Build berhasil!",
+            "build_info": {
+              "rom_url": "$ROM_URL",
+              "rom_branch": "$ROM_BRANCH",
+              "build_variant": "$BUILD_VARIANT",
+              "duration_minutes": $DURATION_MIN,
+              "completed_at": "$(date -Iseconds)"
+            },
+            "downloads": {
+              "pixeldrain": "${PIXELDRAIN_LINK:-\"N/A\"}",
+              "gofile": "${GOFILE_LINK:-\"N/A\"}",
+              "filename": "${IMG_NAME:-\"N/A\"}"
+            }
+          }
+          EOF
+          else
+            cat > status.json << EOF
+          {
+            "status": "failed",
+            "step": "build",
+            "progress": 70,
+            "message": "Build gagal",
+            "error": "Check build logs for details",
+            "build_info": {
+              "rom_url": "$ROM_URL",
+              "rom_branch": "$ROM_BRANCH",
+              "build_variant": "$BUILD_VARIANT",
+              "duration_minutes": $DURATION_MIN
+            }
+          }
+          EOF
+          fi
+
+      - name: Send Telegram Notification
+        run: |
+          if [ "${{ steps.build.outputs.build_success }}" == "true" ]; then
+            MESSAGE="✅ *Build GSI Berhasil!*
+
+📱 *Variant:* $BUILD_VARIANT
+🌿 *Branch:* $ROM_BRANCH
+⏱️ *Duration:* ${DURATION_MIN} menit
+
+📥 *Download Links:*
+• [PixelDrain](${PIXELDRAIN_LINK:-\"N/A\"})
+• [GoFile](${GOFILE_LINK:-\"N/A\"})
+
+📁 *File:* ${IMG_NAME}"
+          else
+            MESSAGE="❌ *Build GSI Gagal!*
+
+📱 *Variant:* $BUILD_VARIANT
+🌿 *Branch:* $ROM_BRANCH
+
+⚠️ Check logs untuk detail error."
+          fi
+          
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            -d "chat_id=$TELEGRAM_CHAT_ID" \
+            -d "parse_mode=Markdown" \
+            -d "text=$MESSAGE"
+
+      - name: Upload Status Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-status
+          path: status.json
+          retention-days: 7
+
+      - name: Upload Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ~/rom/sync.log
+            ~/rom/build.log
+          retention-days: 3
