@@ -74,18 +74,51 @@ jobs:
       - name: Sync ROM Source
         run: |
           mkdir -p ~/rom && cd ~/rom
-          repo init -u $ROM_URL -b $ROM_BRANCH --depth=1 --no-repo-verify
-          git clone https://github.com/TrebleDroid/treble_manifest .repo/local_manifests -b android-15.0
+          
+          # Init repo dengan --no-clone-bundle untuk menghindari error
+          repo init -u $ROM_URL -b $ROM_BRANCH --depth=1 --no-repo-verify --no-clone-bundle
+          
+          # Clone Treble manifest
+          git clone https://github.com/TrebleDroid/treble_manifest .repo/local_manifests -b android-15.0 || {
+            echo "Manifest clone failed, trying alternative method..."
+            rm -rf .repo/local_manifests
+            mkdir -p .repo/local_manifests
+            cd .repo/local_manifests
+            git init
+            git remote add origin https://github.com/TrebleDroid/treble_manifest
+            git fetch --depth=1 origin android-15.0
+            git checkout FETCH_HEAD
+            cd ~/rom
+          }
+          
+          # Remove replace.xml untuk ROM non-AOSP
           if [[ "$ROM_URL" != *"android.git"* ]] || [[ "$ROM_URL" != *"platform"* ]]; then
             rm -f .repo/local_manifests/replace.xml
+            echo "Removed replace.xml for non-AOSP ROM"
           fi
-          repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune
+          
+          # Fix remote conflict jika ada
+          if [ -f ".repo/manifest.xml" ]; then
+            # Backup dan hapus remote yang bentrok
+            sed -i '/remote.*name="github"/d' .repo/manifest.xml 2>/dev/null || true
+          fi
+          
+          # Sync dengan retry mechanism
+          echo "Starting repo sync..."
+          repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune 2>&1 || {
+            echo "First sync failed, trying with different approach..."
+            repo sync -c -j2 --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune 2>&1
+          }
 
       - name: Apply Treble Patches
         run: |
           cd ~/rom
+          
+          # Download patches
           curl -L -o patches.zip https://github.com/TrebleDroid/treble_experimentations/releases/latest/download/patches-for-developers.zip
           unzip -q patches.zip -d patches/
+          
+          # Apply patches
           for patch in patches/*/; do
             if [ -d "$patch" ]; then
               project=$(basename "$patch")
@@ -100,6 +133,8 @@ jobs:
       - name: Generate Device Config
         run: |
           cd ~/rom
+          
+          # Detect ROM type untuk common.mk
           if [ -f "vendor/lineage/config/common_full_phone.mk" ]; then
             COMMON_MK="vendor/lineage/config/common_full_phone.mk"
           elif [ -f "vendor/aosp/config/common_full_phone.mk" ]; then
@@ -107,6 +142,7 @@ jobs:
           else
             COMMON_MK=$(find vendor -name "common_full_phone.mk" 2>/dev/null | head -1)
           fi
+          
           cd device/phh/treble
           bash generate.sh $COMMON_MK
 
@@ -117,15 +153,15 @@ jobs:
           source build/envsetup.sh
           lunch $BUILD_VARIANT
           WITHOUT_CHECK_API=true make -j$(nproc --all) systemimage
-          echo "build_success=true" >> $GITHUB_OUTPUT
 
       - name: Compress and Upload
-        if: steps.build.outputs.build_success == 'true'
+        if: success()
         run: |
           cd ~/rom/out/target/product/phh*/
           xz -9 -T$(nproc --all) -v -z system.img
           IMG_NAME="GSI-$(date +%Y%m%d)-${BUILD_VARIANT}.img.xz"
           mv system.img.xz $IMG_NAME
+          
           if [ -n "$PIXELDRAIN_API_KEY" ]; then
             curl -T "$IMG_NAME" -u :$PIXELDRAIN_API_KEY https://pixeldrain.com/api/file/
           fi
