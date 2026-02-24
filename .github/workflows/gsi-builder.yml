@@ -55,7 +55,7 @@ jobs:
             python3 perl xmlstarlet virtualenv xz-utils rr jq libncurses5 \
             pngcrush lib32ncurses5-dev git-lfs libxml2-utils repo ccache
 
-      - name: Setup SDK & Repo
+      - name: Setup SDK and Repo
         run: |
           echo "Setup repo command..."
           
@@ -166,7 +166,7 @@ jobs:
             exit 1
           fi
 
-      - name: Compress & Upload
+      - name: Compress and Upload
         id: upload
         if: steps.build.outputs.build_success == 'true'
         run: |
@@ -255,7 +255,7 @@ EOF
           path: build-report.txt
           retention-days: 30
 
-      - name: Upload Download Links (on success)
+      - name: Upload GSI Image
         if: steps.build.outputs.build_success == 'true'
         uses: actions/upload-artifact@v4
         with:
