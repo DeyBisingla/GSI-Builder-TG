@@ -21,19 +21,11 @@ on:
           - treble_arm64_bgN-userdebug
           - treble_a64_bvN-userdebug
           - treble_a64_bgN-userdebug
-      telegram_chat_id:
-        description: 'Telegram Chat ID'
-        required: true
-      telegram_bot_token:
-        description: 'Telegram Bot Token'
-        required: true
 
 env:
   ROM_URL: ${{ github.event.inputs.rom_url }}
   ROM_BRANCH: ${{ github.event.inputs.rom_branch }}
   BUILD_VARIANT: ${{ github.event.inputs.build_variant }}
-  TELEGRAM_CHAT_ID: ${{ github.event.inputs.telegram_chat_id }}
-  TELEGRAM_BOT_TOKEN: ${{ github.event.inputs.telegram_bot_token }}
   CLOUDFLARE_KEY: ${{ secrets.CLOUDFLARE_KEY }}
   PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
   GOFILE_API_KEY: ${{ secrets.GOFILE_API_KEY }}
@@ -297,47 +289,28 @@ jobs:
           EOF
           fi
 
-      - name: Send Telegram Notification
-        run: |
-          if [ "${{ steps.build.outputs.build_success }}" == "true" ]; then
-            MESSAGE="✅ *Build GSI Berhasil!*
-
-📱 *Variant:* $BUILD_VARIANT
-🌿 *Branch:* $ROM_BRANCH
-⏱️ *Duration:* ${DURATION_MIN} menit
-
-📥 *Download Links:*
-• [PixelDrain](${PIXELDRAIN_LINK:-\"N/A\"})
-• [GoFile](${GOFILE_LINK:-\"N/A\"})
-
-📁 *File:* ${IMG_NAME}"
-          else
-            MESSAGE="❌ *Build GSI Gagal!*
-
-📱 *Variant:* $BUILD_VARIANT
-🌿 *Branch:* $ROM_BRANCH
-
-⚠️ Check logs untuk detail error."
-          fi
-          
-          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-            -d "chat_id=$TELEGRAM_CHAT_ID" \
-            -d "parse_mode=Markdown" \
-            -d "text=$MESSAGE"
-
       - name: Upload Status Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: build-status
+          name: build-status-${{ github.run_id }}
           path: status.json
-          retention-days: 7
+          retention-days: 30
+
+      - name: Upload Download Links
+        if: steps.build.outputs.build_success == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-links-${{ github.run_id }}
+          path: |
+            status.json
+          retention-days: 30
 
       - name: Upload Logs on Failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-logs-${{ github.run_id }}
           path: |
             ~/rom/sync.log
             ~/rom/build.log
-          retention-days: 3
+          retention-days: 7
