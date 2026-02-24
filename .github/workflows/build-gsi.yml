@@ -1,175 +1,24 @@
-name: GSI Builder
-
-on:
-  workflow_dispatch:
-    inputs:
-      rom_url:
-        description: 'ROM Manifest URL'
-        required: true
-        default: 'https://github.com/LineageOS/android.git'
-      rom_branch:
-        description: 'ROM Branch'
-        required: true
-        default: 'lineage-22.1'
-      build_variant:
-        description: 'Build Variant'
-        required: true
-        default: 'treble_arm64_bvN-userdebug'
-        type: choice
-        options:
-          - treble_arm64_bvN-userdebug
-          - treble_arm64_bgN-userdebug
-          - treble_a64_bvN-userdebug
-          - treble_a64_bgN-userdebug
-
-env:
-  ROM_URL: ${{ github.event.inputs.rom_url }}
-  ROM_BRANCH: ${{ github.event.inputs.rom_branch }}
-  BUILD_VARIANT: ${{ github.event.inputs.build_variant }}
-  PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
-  GOFILE_API_KEY: ${{ secrets.GOFILE_API_KEY }}
-  CCACHE_COMPRESS: true
-  CCACHE_MAXSIZE: 50G
-
-jobs:
-  build-gsi:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
-    
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Initialize Build Environment
-        id: init
-        run: |
-          echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            bc bison build-essential curl flex g++-multilib gcc-multilib git \
-            gnupg gperf libxml2 lib32z1-dev liblz4-tool libncurses5-dev \
-            libsdl1.2-dev libwxgtk3.0-gtk3-dev imagemagick git lunzip lzop \
-            schedtool squashfs-tools xsltproc zip zlib1g-dev openjdk-11-jdk \
-            python3 perl xmlstarlet virtualenv xz-utils rr jq libncurses5 \
-            pngcrush lib32ncurses5-dev git-lfs libxml2-utils repo ccache
-
-      - name: Setup SDK and Repo
-        run: |
-          mkdir -p ~/bin
-          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-          chmod a+x ~/bin/repo
-          echo "$HOME/bin" >> $GITHUB_PATH
-          git config --global user.name "GSI Builder"
-          git config --global user.email "builder@gsi.local"
-          git config --global color.ui false
-
-      - name: Setup CCache
-        run: |
-          export USE_CCACHE=1
-          export CCACHE_COMPRESS=1
-          export CCACHE_MAXSIZE=50G
-          ccache -M 50G
-          ccache -o compression=true
-
       - name: Sync ROM Source
         run: |
           mkdir -p ~/rom && cd ~/rom
           
-          # Init repo dengan --no-clone-bundle untuk menghindari error
+          # Init repo
           repo init -u $ROM_URL -b $ROM_BRANCH --depth=1 --no-repo-verify --no-clone-bundle
           
+          # Hapus SEMUA file yang mengandung remote github
+          find .repo -name "*.xml" -exec grep -l 'remote.*github' {} \; | xargs -I {} rm -f {}
+          
           # Clone Treble manifest
-          git clone https://github.com/TrebleDroid/treble_manifest .repo/local_manifests -b android-15.0 || {
-            echo "Manifest clone failed, trying alternative method..."
-            rm -rf .repo/local_manifests
-            mkdir -p .repo/local_manifests
-            cd .repo/local_manifests
-            git init
-            git remote add origin https://github.com/TrebleDroid/treble_manifest
-            git fetch --depth=1 origin android-15.0
-            git checkout FETCH_HEAD
-            cd ~/rom
-          }
+          rm -rf .repo/local_manifests
+          git clone https://github.com/TrebleDroid/treble_manifest .repo/local_manifests -b android-15.0
           
-          # Remove replace.xml untuk ROM non-AOSP
-          if [[ "$ROM_URL" != *"android.git"* ]] || [[ "$ROM_URL" != *"platform"* ]]; then
+          # Hapus replace.xml untuk non-AOSP
+          if [[ "$ROM_URL" != *"android.git"* ]] && [[ "$ROM_URL" != *"platform"* ]]; then
             rm -f .repo/local_manifests/replace.xml
-            echo "Removed replace.xml for non-AOSP ROM"
           fi
           
-          # Fix remote conflict jika ada
-          if [ -f ".repo/manifest.xml" ]; then
-            # Backup dan hapus remote yang bentrok
-            sed -i '/remote.*name="github"/d' .repo/manifest.xml 2>/dev/null || true
-          fi
+          # Re-init tanpa manifest yang bermasalah
+          repo init -u $ROM_URL -b $ROM_BRANCH --depth=1 --no-repo-verify --no-clone-bundle --manifest-url=file://$(pwd)/.repo/manifests
           
-          # Sync dengan retry mechanism
-          echo "Starting repo sync..."
-          repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune 2>&1 || {
-            echo "First sync failed, trying with different approach..."
-            repo sync -c -j2 --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune 2>&1
-          }
-
-      - name: Apply Treble Patches
-        run: |
-          cd ~/rom
-          
-          # Download patches
-          curl -L -o patches.zip https://github.com/TrebleDroid/treble_experimentations/releases/latest/download/patches-for-developers.zip
-          unzip -q patches.zip -d patches/
-          
-          # Apply patches
-          for patch in patches/*/; do
-            if [ -d "$patch" ]; then
-              project=$(basename "$patch")
-              if [ -d "$project" ]; then
-                cd "$project"
-                git am ../patches/$project/*.patch 2>/dev/null || echo "Patch failed for $project, continuing..."
-                cd ~/rom
-              fi
-            fi
-          done
-
-      - name: Generate Device Config
-        run: |
-          cd ~/rom
-          
-          # Detect ROM type untuk common.mk
-          if [ -f "vendor/lineage/config/common_full_phone.mk" ]; then
-            COMMON_MK="vendor/lineage/config/common_full_phone.mk"
-          elif [ -f "vendor/aosp/config/common_full_phone.mk" ]; then
-            COMMON_MK="vendor/aosp/config/common_full_phone.mk"
-          else
-            COMMON_MK=$(find vendor -name "common_full_phone.mk" 2>/dev/null | head -1)
-          fi
-          
-          cd device/phh/treble
-          bash generate.sh $COMMON_MK
-
-      - name: Build GSI
-        id: build
-        run: |
-          cd ~/rom
-          source build/envsetup.sh
-          lunch $BUILD_VARIANT
-          WITHOUT_CHECK_API=true make -j$(nproc --all) systemimage
-
-      - name: Compress and Upload
-        if: success()
-        run: |
-          cd ~/rom/out/target/product/phh*/
-          xz -9 -T$(nproc --all) -v -z system.img
-          IMG_NAME="GSI-$(date +%Y%m%d)-${BUILD_VARIANT}.img.xz"
-          mv system.img.xz $IMG_NAME
-          
-          if [ -n "$PIXELDRAIN_API_KEY" ]; then
-            curl -T "$IMG_NAME" -u :$PIXELDRAIN_API_KEY https://pixeldrain.com/api/file/
-          fi
-
-      - name: Upload GSI Image
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: GSI-Image-${{ github.run_id }}
-          path: ~/rom/out/target/product/phh*/*.img.xz
-          retention-days: 7
+          # Sync
+          repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune
